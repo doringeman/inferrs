@@ -379,7 +379,8 @@ llmman config set pager.log 'less -+F'
 
 `pager.providers` and `pager.log` accept the strings `true` or `false` to
 use or disable paging, or a shell command to select that command's pager.
-The pager command is chosen from `LLMMAN_PAGER`, the command-specific
+A command-specific `false` disables paging even when `LLMMAN_PAGER` is set.
+Otherwise, the pager command is chosen from `LLMMAN_PAGER`, the command-specific
 setting, `core.pager`, `PAGER`, then `less`, in that order. An empty command
 or `cat` disables paging. `LESS=FRX` and `LV=-c` are supplied only when those
 variables are unset.
