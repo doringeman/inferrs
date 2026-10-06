@@ -28,30 +28,21 @@ fn unknown_subcommand_exits_2() {
 #[test]
 fn log_follow_filters_new_prompts_and_does_not_limit_them_to_max_count() {
     use std::io::{BufRead, BufReader};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     struct Fixture {
         child: std::process::Child,
-        dir: std::path::PathBuf,
+        _dir: tempfile::TempDir,
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = self.child.kill();
             let _ = self.child.wait();
-            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
-    let dir = std::env::temp_dir().join(format!(
-        "llmman-cli-follow-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("prompts.jsonl");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("prompts.jsonl");
     let entry = |id: &str, model: &str, prompt: &str| llmman::promptlog::Entry {
         id: id.into(),
         model: model.into(),
@@ -78,13 +69,13 @@ fn log_follow_filters_new_prompts_and_does_not_limit_them_to_max_count() {
             "--grep",
             "keep",
         ])
-        .env("LLMMAN_MODELS", dir.join("store"))
+        .env("LLMMAN_MODELS", dir.path().join("store"))
         .env("LLMMAN_PAGER", "exit 1")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let mut fixture = Fixture { child, dir };
+    let mut fixture = Fixture { child, _dir: dir };
     let stdout = fixture.child.stdout.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
