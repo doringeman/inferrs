@@ -10,6 +10,7 @@ use std::time::Duration;
 use anyhow::{bail, Context};
 use chrono::{DateTime, Local, Utc};
 use clap::Args;
+use sha2::{Digest, Sha256};
 
 use crate::promptlog::Entry;
 
@@ -172,7 +173,7 @@ fn write_follow(text: &str) -> io::Result<bool> {
 struct Tail {
     reader: Option<BufReader<File>>,
     pending: Vec<u8>,
-    checkpoint: Option<(u64, Vec<u8>)>,
+    consumed: Sha256,
 }
 
 impl Tail {
@@ -187,24 +188,27 @@ impl Tail {
         let reader = self.reader.as_mut().unwrap();
         let position = reader.stream_position()?;
         let mut reset = reader.get_ref().metadata()?.len() < position;
-        // A truncate-and-refill can leave the file longer than our cursor.
-        // Check the last consumed line, including any unfinished fragment.
-        if !reset {
-            if let Some((offset, bytes)) = &self.checkpoint {
-                reader.seek(SeekFrom::Start(*offset))?;
-                let mut current = vec![0; bytes.len()];
-                match reader.read_exact(&mut current) {
-                    Ok(()) => reset = current != *bytes,
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => reset = true,
-                    Err(e) => return Err(e),
+        // A refill can preserve both file length and the last line. Validate
+        // the entire consumed prefix with bounded memory before resuming.
+        if !reset && position != 0 {
+            reader.seek(SeekFrom::Start(0))?;
+            let mut prefix = reader.by_ref().take(position);
+            let mut digest = Sha256::new();
+            let mut buffer = [0; 8192];
+            loop {
+                let read = prefix.read(&mut buffer)?;
+                if read == 0 {
+                    break;
                 }
-                reader.seek(SeekFrom::Start(position))?;
+                digest.update(&buffer[..read]);
             }
+            reset = digest.finalize() != self.consumed.clone().finalize();
+            reader.seek(SeekFrom::Start(position))?;
         }
         if reset {
             reader.seek(SeekFrom::Start(0))?;
             self.pending.clear();
-            self.checkpoint = None;
+            self.consumed = Sha256::new();
         }
         let mut entries = Vec::new();
         loop {
@@ -212,10 +216,8 @@ impl Tail {
             if read == 0 {
                 break;
             }
-            self.checkpoint = Some((
-                reader.stream_position()? - self.pending.len() as u64,
-                self.pending.clone(),
-            ));
+            self.consumed
+                .update(&self.pending[self.pending.len() - read..]);
             // A JSON value can parse before its writer has finished the line.
             // Keep the partial line across polls and emit only once it is complete.
             if self.pending.last() == Some(&b'\n') {
@@ -407,7 +409,7 @@ mod tests {
         file.write_all(b"\ninvalid json\n").unwrap();
         assert_eq!(tail.read(&path).unwrap(), [second]);
         assert!(tail.read(&path).unwrap().is_empty());
-        file.set_len(0).unwrap();
+        File::create(&path).unwrap();
         assert!(tail.read(&path).unwrap().is_empty());
         crate::promptlog::append(&path, &entry()).unwrap();
         assert_eq!(tail.read(&path).unwrap(), [entry()]);
@@ -434,6 +436,32 @@ mod tests {
             crate::promptlog::append(&path, &entry()).unwrap();
             assert_eq!(tail.read(&path).unwrap(), [entry()]);
         }
+    }
+
+    #[test]
+    fn follow_detects_a_refill_that_preserves_the_last_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompts.jsonl");
+        let mut tail = Tail::default();
+        let first = entry();
+        let last = Entry {
+            id: "last".into(),
+            ..entry()
+        };
+        crate::promptlog::append(&path, &first).unwrap();
+        crate::promptlog::append(&path, &last).unwrap();
+        assert_eq!(tail.read(&path).unwrap(), [first, last.clone()]);
+        let previous_len = std::fs::metadata(&path).unwrap().len();
+        let replacement = Entry {
+            id: "fedcba9876543210fedcba9876543210fedcba98".into(),
+            ..entry()
+        };
+        File::create(&path).unwrap();
+        crate::promptlog::append(&path, &replacement).unwrap();
+        crate::promptlog::append(&path, &last).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), previous_len);
+        assert_eq!(tail.read(&path).unwrap(), [replacement, last]);
+        assert!(tail.read(&path).unwrap().is_empty());
     }
 
     #[test]
