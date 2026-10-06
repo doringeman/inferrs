@@ -3,7 +3,7 @@
 //! server), newest first, through a pager on a terminal.
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, IsTerminal, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -172,6 +172,7 @@ fn write_follow(text: &str) -> io::Result<bool> {
 struct Tail {
     reader: Option<BufReader<File>>,
     pending: Vec<u8>,
+    checkpoint: Option<(u64, Vec<u8>)>,
 }
 
 impl Tail {
@@ -184,9 +185,26 @@ impl Tail {
             }
         }
         let reader = self.reader.as_mut().unwrap();
-        if reader.get_ref().metadata()?.len() < reader.stream_position()? {
+        let position = reader.stream_position()?;
+        let mut reset = reader.get_ref().metadata()?.len() < position;
+        // A truncate-and-refill can leave the file longer than our cursor.
+        // Check the last consumed line, including any unfinished fragment.
+        if !reset {
+            if let Some((offset, bytes)) = &self.checkpoint {
+                reader.seek(SeekFrom::Start(*offset))?;
+                let mut current = vec![0; bytes.len()];
+                match reader.read_exact(&mut current) {
+                    Ok(()) => reset = current != *bytes,
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => reset = true,
+                    Err(e) => return Err(e),
+                }
+                reader.seek(SeekFrom::Start(position))?;
+            }
+        }
+        if reset {
             reader.seek(SeekFrom::Start(0))?;
             self.pending.clear();
+            self.checkpoint = None;
         }
         let mut entries = Vec::new();
         loop {
@@ -194,6 +212,10 @@ impl Tail {
             if read == 0 {
                 break;
             }
+            self.checkpoint = Some((
+                reader.stream_position()? - self.pending.len() as u64,
+                self.pending.clone(),
+            ));
             // A JSON value can parse before its writer has finished the line.
             // Keep the partial line across polls and emit only once it is complete.
             if self.pending.last() == Some(&b'\n') {
@@ -363,9 +385,8 @@ mod tests {
 
     #[test]
     fn follow_reads_each_complete_line_once_and_recovers_after_truncation() {
-        let dir = std::env::temp_dir().join(format!("llmman-log-follow-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("prompts.jsonl");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompts.jsonl");
         let mut tail = Tail::default();
         assert!(tail.read(&path).unwrap().is_empty());
         let first = entry();
@@ -390,9 +411,42 @@ mod tests {
         assert!(tail.read(&path).unwrap().is_empty());
         crate::promptlog::append(&path, &entry()).unwrap();
         assert_eq!(tail.read(&path).unwrap(), [entry()]);
-        drop(tail);
-        drop(file);
-        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn follow_recovers_when_truncation_and_refill_happen_between_polls() {
+        for extra in ["", " with a longer prompt"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("prompts.jsonl");
+            let mut tail = Tail::default();
+            let first = entry();
+            crate::promptlog::append(&path, &first).unwrap();
+            assert_eq!(tail.read(&path).unwrap(), [first]);
+            let replacement = Entry {
+                id: "fedcba9876543210fedcba9876543210fedcba98".into(),
+                prompt: format!("{}{extra}", entry().prompt),
+                ..entry()
+            };
+            File::create(&path).unwrap();
+            crate::promptlog::append(&path, &replacement).unwrap();
+            assert_eq!(tail.read(&path).unwrap(), [replacement]);
+            assert!(tail.read(&path).unwrap().is_empty());
+            crate::promptlog::append(&path, &entry()).unwrap();
+            assert_eq!(tail.read(&path).unwrap(), [entry()]);
+        }
+    }
+
+    #[test]
+    fn follow_discards_a_partial_line_when_the_file_is_refilled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompts.jsonl");
+        std::fs::write(&path, b"{\"id\":\"unfinished").unwrap();
+        let mut tail = Tail::default();
+        assert!(tail.read(&path).unwrap().is_empty());
+        File::create(&path).unwrap();
+        crate::promptlog::append(&path, &entry()).unwrap();
+        assert_eq!(tail.read(&path).unwrap(), [entry()]);
+        assert!(tail.read(&path).unwrap().is_empty());
     }
 
     #[test]
